@@ -8,6 +8,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
+import math
+import random
 
 import cv2
 import numpy as np
@@ -52,7 +54,8 @@ class SOLO2COCOConverter:
 
     def __init__(self, solo: Solo):
         self._solo = solo
-        self._pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
+        self._pool = multiprocessing.Pool(
+            processes=1)  # multiprocessing.cpu_count())
         self._bbox_annotations = []
         self._instance_annotations = []
         self._semantic_annotations = []
@@ -106,7 +109,8 @@ class SOLO2COCOConverter:
             img: Segmentation image
 
         """
-        file_path = os.path.join(data_root, f"sequence.{sequence_num}", filename)
+        file_path = os.path.join(
+            data_root, f"sequence.{sequence_num}", filename)
         img = cv2.imread(file_path, -1)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
@@ -199,7 +203,7 @@ class SOLO2COCOConverter:
 
     @staticmethod
     def _process_annotations(
-        image_id, rgb_capture, sequence_num, data_root, solo_kp_map
+        output, image_id, rgb_capture, sequence_num, data_root, solo_kp_map, interaction_metadata
     ):
         bbox_annotations = []
         instance_annotations = []
@@ -221,7 +225,8 @@ class SOLO2COCOConverter:
             ann_type=KeypointAnnotation, annotations=rgb_capture.annotations
         )
         if kp_ann:
-            keypoint_map = SOLO2COCOConverter._keypoints_map(solo_kp_map, kp_ann)
+            keypoint_map = SOLO2COCOConverter._keypoints_map(
+                solo_kp_map, kp_ann)
         else:
             keypoint_map = {}
 
@@ -266,10 +271,19 @@ class SOLO2COCOConverter:
             ins_seg_img = SOLO2COCOConverter._load_segmentation_image(
                 ins_seg.filename, data_root, sequence_num
             )
+            # Saving instance masks and depth maps
+            save_masks_and_depth(image_id, ins_seg.filename, output,
+                                 data_root, sequence_num)
             ins_seg_instances = ins_seg.instances
 
             if len(bbox_ann) != len(ins_seg_instances):
-                raise ValueError("All bounding boxes does not have segmentation map.")
+                raise ValueError(
+                    "All bounding boxes does not have segmentation map.")
+
+            # Added to map label_id and the bbox to fetch bbox of the active object
+            label_to_bboxmap = dict(
+                [(element.labelId, [element.origin[0], element.origin[1], element.dimension[0], element.dimension[1]]) for element in bbox_ann])
+            label_to_bboxmap[-1] = [-1, -1, -1, -1]
 
             for bbox, ins in zip(bbox_ann, ins_seg_instances):
 
@@ -296,7 +310,14 @@ class SOLO2COCOConverter:
                     "num_keypoints": num_keypoints,
                     "category_id": bbox.labelId,
                     "id": bbox.instanceId,
+                    "instance_id_color": {'r': ins.color[0], 'g': ins.color[1], 'b': ins.color[2], 'a': ins.color[3]},
                 }
+                record.update(interaction_metadata[str(bbox.instanceId)])
+                try:
+                    record["bbox_obj"] = label_to_bboxmap[record['id_obj']]
+                except KeyError:  # In cases where the object is occluded, the bbox of the active object is not fetched
+                    record["bbox_obj"] = [-1, -1, -1, -1]
+
                 instance_annotations.append(record)
 
         else:
@@ -332,7 +353,8 @@ class SOLO2COCOConverter:
         ann_defs = self._solo.annotation_definitions.annotationDefinitions
         bbox_ann_def = list(
             filter(
-                lambda ann_def: isinstance(ann_def, BoundingBox2DAnnotationDefinition),
+                lambda ann_def: isinstance(
+                    ann_def, BoundingBox2DAnnotationDefinition),
                 ann_defs,
             )
         )[0]
@@ -355,7 +377,7 @@ class SOLO2COCOConverter:
         with open(output_file, "w") as out:
             json.dump(data, out, indent=3)
 
-    def _write_out_annotations(self, output_dir):
+    def _write_out_annotations(self, output_dir, type):
         date_time = datetime.now()
         date_created = date_time.strftime("%A, %d %B, %Y")
         instances = {
@@ -382,7 +404,93 @@ class SOLO2COCOConverter:
             for idx, ann in enumerate(self._instance_annotations):
                 ann["id"] = idx
             instances["annotations"] = self._instance_annotations
-            self._create_ann_file(instances, output_dir, "instances.json")
+            if type == 'train':
+                self._create_ann_file(
+                    instances, output_dir, "train.json")
+            if type == 'test':
+                self._create_ann_file(
+                    instances, output_dir, "test.json")
+
+                # Adding fields for val_hands.json - contains data only specific to the hand and the contact obj
+                hands_data = {
+                    "images": instances["images"], "annotations": [], "categories": []}
+
+                ctr = 0
+                for annotation in instances["annotations"]:
+                    if annotation["hand_side"] in [0, 1]:
+
+                        record = {
+                            "id": ctr,
+                            "image_id": annotation["image_id"],
+                            "category_id": 0,
+                            "bbox": annotation["bbox"],
+                            "area": annotation["area"],
+                            "iscrowd": annotation["iscrowd"],
+                            "hand_side": annotation["hand_side"],
+                            "contact_state": annotation["contact_state"],
+                            "bbox_obj": [] if annotation["bbox_obj"] == [-1, -1, -1, -1] else annotation["bbox_obj"],
+                            "category_id_obj": annotation["id_obj"],
+                        }
+                        if annotation["contact_state"] == 1:
+                            bbox = annotation['bbox_obj']
+                            area = bbox[2] * bbox[3]
+                            record["area_obj"] = area
+
+                        hands_data["annotations"].append(record)
+                        ctr += 1
+
+                for category in instances["categories"]:
+                    if category['name'] == 'hand':
+                        hands_data["categories"].append({
+                            "id": 0,
+                            "name": category["name"],
+                            "supercategory": category["supercategory"]
+                        })
+
+                self._create_ann_file(
+                    hands_data, output_dir, "test_hands.json")
+        if type == 'val':
+            self._create_ann_file(
+                instances, output_dir, "val.json")
+
+            # Adding fields for val_hands.json - contains data only specific to the hand and the contact obj
+            hands_data = {
+                "images": instances["images"], "annotations": [], "categories": []}
+
+            ctr = 0
+            for annotation in instances["annotations"]:
+                if annotation["hand_side"] in [0, 1]:
+
+                    record = {
+                        "id": ctr,
+                        "image_id": annotation["image_id"],
+                        "category_id": 0,
+                        "bbox": annotation["bbox"],
+                        "area": annotation["area"],
+                        "iscrowd": annotation["iscrowd"],
+                        "hand_side": annotation["hand_side"],
+                        "contact_state": annotation["contact_state"],
+                        "bbox_obj": [] if annotation["bbox_obj"] == [-1, -1, -1, -1] else annotation["bbox_obj"],
+                        "category_id_obj": annotation["id_obj"],
+                    }
+                    if annotation["contact_state"] == 1:
+                        bbox = annotation['bbox_obj']
+                        area = bbox[2] * bbox[3]
+                        record["area_obj"] = area
+
+                    hands_data["annotations"].append(record)
+                    ctr += 1
+
+            for category in instances["categories"]:
+                if category['name'] == 'hand':
+                    hands_data["categories"].append({
+                        "id": 0,
+                        "name": category["name"],
+                        "supercategory": category["supercategory"]
+                    })
+
+            self._create_ann_file(
+                hands_data, output_dir, "val_hands.json")
         else:
             for idx, ann in enumerate(self._bbox_annotations):
                 ann["id"] = idx
@@ -397,8 +505,14 @@ class SOLO2COCOConverter:
         image_id = idx
         sequence_num = frame.sequence
         rgb_capture = list(
-            filter(lambda cap: isinstance(cap, RGBCameraCapture), frame.captures)
+            filter(lambda cap: isinstance(
+                cap, RGBCameraCapture), frame.captures)
         )[0]
+        interaction_metadata = [
+            metric for metric in frame.metrics if metric['id'] == 'metadata'][0]
+        interaction_metadata = interaction_metadata['values'][0]['instances']
+        interaction_metadata = dict(
+            [(element['instanceId'], element['hand_object_interaction']) for element in interaction_metadata])
 
         img_record = SOLO2COCOConverter._process_rgb_image(
             image_id, rgb_capture, output, data_root, sequence_num
@@ -408,7 +522,7 @@ class SOLO2COCOConverter:
             ins_ann_record,
             sem_ann_record,
         ) = SOLO2COCOConverter._process_annotations(
-            image_id, rgb_capture, sequence_num, data_root, solo_kp_map
+            output, image_id, rgb_capture, sequence_num, data_root, solo_kp_map, interaction_metadata
         )
 
         return img_record, ann_record, ins_ann_record, sem_ann_record
@@ -440,16 +554,87 @@ class SOLO2COCOConverter:
 
         solo_kp_map = self._get_solo_kp_map()
 
-        for idx, frame in enumerate(self._solo.frames()):
-            self._pool.apply_async(
-                self._process_instances,
-                args=(frame, idx, output, self._solo.data_path, solo_kp_map),
-                callback=self.callback,
-            )
-        self._pool.close()
-        self._pool.join()
+        frames_list = list(enumerate(self._solo.frames()))
+        random.shuffle(frames_list)
 
-        self._write_out_annotations(output)
+        # train, val and test split
+        train_ratio = 0.8
+        val_ratio = 0.05
+        test_ratio = 0.15
+
+        train_split = frames_list[: int(len(frames_list)*0.8)]
+        test_split = frames_list[int(len(frames_list)*0.8):]
+
+        train_split = frames_list[: int(len(frames_list) * train_ratio)]
+        val_split = frames_list[int(len(
+            frames_list) * train_ratio): int(len(frames_list) * (train_ratio + val_ratio))]
+        test_split = frames_list[int(
+            len(frames_list) * (train_ratio + val_ratio)):]
+
+        for idx, frame in train_split:
+            result = self._process_instances(
+                frame, idx, output, self._solo.data_path, solo_kp_map)
+            self.callback(result)
+            # multi-processing commented out - to catch errors
+            # self._pool.apply_async(
+            # self._process_instances,
+            # args=(frame, idx, output, self._solo.data_path, solo_kp_map),
+            # callback=self.callback,
+            # )
+        # self._pool.close()
+        # self._pool.join()
+        self._write_out_annotations(output, type='train')
+
+        clear_anns()
+        for idx, frame in val_split:
+            result = self._process_instances(
+                frame, idx, output, self._solo.data_path, solo_kp_map)
+            self.callback(result)
+
+        self._write_out_annotations(output, type='test')
+
+        clear_anns()
+        for idx, frame in test_split:
+            result = self._process_instances(
+                frame, idx, output, self._solo.data_path, solo_kp_map)
+            self.callback(result)
+
+        self._write_out_annotations(output, type='test')
+
+        def clear_anns(self):
+            # clearing out previously written annotations
+            self._images = []
+            self._bbox_annotations = []
+            self._instance_annotations = []
+            self._semantic_annotations = []
+
+
+def save_masks_and_depth(image_id, filename, output, data_root, sequence_num):
+    """Saves instance masks and depth maps from a sequence.
+
+    Args:
+        image_id (int): Image ID
+        filename: Name of the instance segmentation image file.
+        output (str): Output directory path
+        data_root (str): Data root path
+        sequence_num (int): Sequence number
+    """
+
+    os.makedirs(os.path.join(output, "instance_masks"), exist_ok=True)
+    os.makedirs(os.path.join(output, "depth_maps"), exist_ok=True)
+
+    sequence_path = f"sequence.{sequence_num}"
+
+    mask_file_path = os.path.join(data_root, sequence_path, filename)
+    depth_file_path = os.path.join(
+        data_root, sequence_path, filename.replace("instance segmentation.png", "Depth.exr"))
+
+    mask_save_path = os.path.join(
+        output, "instance_masks", f"mask_{image_id}.png")
+    depth_save_path = os.path.join(output, "depth_maps", f"map_{image_id}.png")
+
+    shutil.copy(mask_file_path, mask_save_path)
+    shutil.copy(depth_file_path, depth_save_path)
 
 
 def cli():
