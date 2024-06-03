@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 import math
 import random
+from multiprocessing import Pool
 
 import cv2
 import numpy as np
@@ -413,7 +414,7 @@ class SOLO2COCOConverter:
 
                 # Adding fields for val_hands.json - contains data only specific to the hand and the contact obj
                 hands_data = {
-                    "images": instances["images"], "annotations": [], "categories": []}
+                    "info":instances["info"], "licences": instances["licences"], "images": instances["images"], "annotations": [], "categories": []}
 
                 ctr = 0
                 for annotation in instances["annotations"]:
@@ -449,48 +450,49 @@ class SOLO2COCOConverter:
 
                 self._create_ann_file(
                     hands_data, output_dir, "test_hands.json")
-        if type == 'val':
-            self._create_ann_file(
-                instances, output_dir, "val.json")
+            
+            if type == 'val':
+                self._create_ann_file(
+                    instances, output_dir, "val.json")
 
-            # Adding fields for val_hands.json - contains data only specific to the hand and the contact obj
-            hands_data = {
-                "images": instances["images"], "annotations": [], "categories": []}
+                # Adding fields for val_hands.json - contains data only specific to the hand and the contact obj
+                hands_data = {
+                    "images": instances["images"], "annotations": [], "categories": []}
 
-            ctr = 0
-            for annotation in instances["annotations"]:
-                if annotation["hand_side"] in [0, 1]:
+                ctr = 0
+                for annotation in instances["annotations"]:
+                    if annotation["hand_side"] in [0, 1]:
 
-                    record = {
-                        "id": ctr,
-                        "image_id": annotation["image_id"],
-                        "category_id": 0,
-                        "bbox": annotation["bbox"],
-                        "area": annotation["area"],
-                        "iscrowd": annotation["iscrowd"],
-                        "hand_side": annotation["hand_side"],
-                        "contact_state": annotation["contact_state"],
-                        "bbox_obj": [] if annotation["bbox_obj"] == [-1, -1, -1, -1] else annotation["bbox_obj"],
-                        "category_id_obj": annotation["id_obj"],
-                    }
-                    if annotation["contact_state"] == 1:
-                        bbox = annotation['bbox_obj']
-                        area = bbox[2] * bbox[3]
-                        record["area_obj"] = area
+                        record = {
+                            "id": ctr,
+                            "image_id": annotation["image_id"],
+                            "category_id": 0,
+                            "bbox": annotation["bbox"],
+                            "area": annotation["area"],
+                            "iscrowd": annotation["iscrowd"],
+                            "hand_side": annotation["hand_side"],
+                            "contact_state": annotation["contact_state"],
+                            "bbox_obj": [] if annotation["bbox_obj"] == [-1, -1, -1, -1] else annotation["bbox_obj"],
+                            "category_id_obj": annotation["id_obj"],
+                        }
+                        if annotation["contact_state"] == 1:
+                            bbox = annotation['bbox_obj']
+                            area = bbox[2] * bbox[3]
+                            record["area_obj"] = area
 
-                    hands_data["annotations"].append(record)
-                    ctr += 1
+                        hands_data["annotations"].append(record)
+                        ctr += 1
 
-            for category in instances["categories"]:
-                if category['name'] == 'hand':
-                    hands_data["categories"].append({
-                        "id": 0,
-                        "name": category["name"],
-                        "supercategory": category["supercategory"]
-                    })
+                for category in instances["categories"]:
+                    if category['name'] == 'hand':
+                        hands_data["categories"].append({
+                            "id": 0,
+                            "name": category["name"],
+                            "supercategory": category["supercategory"]
+                        })
 
-            self._create_ann_file(
-                hands_data, output_dir, "val_hands.json")
+                self._create_ann_file(
+                    hands_data, output_dir, "val_hands.json")
         else:
             for idx, ann in enumerate(self._bbox_annotations):
                 ann["id"] = idx
@@ -549,10 +551,30 @@ class SOLO2COCOConverter:
         self._instance_annotations += result[2]
         self._semantic_annotations += result[3]
 
+    def _process_split(self, split, output, split_type):
+        solo_kp_map = self._get_solo_kp_map()
+
+        with Pool() as pool:
+            for idx, frame in split:
+                pool.apply_async(
+                self._process_instances,
+                args=(frame, idx, output, self._solo.data_path, solo_kp_map),
+                callback=self.callback,
+            )
+            pool.close()
+            pool.join()
+
+        self._write_out_annotations(output, type=split_type)
+        self._clear_annotations()
+    
+    def _clear_annotations(self):
+        self._images = []
+        self._bbox_annotations = []
+        self._instance_annotations = []
+        self._semantic_annotations = []
+
     def convert(self, output_path: str, dataset_name: str = "coco"):
         output = os.path.join(output_path, dataset_name)
-
-        solo_kp_map = self._get_solo_kp_map()
 
         frames_list = list(enumerate(self._solo.frames()))
         random.shuffle(frames_list)
@@ -560,54 +582,16 @@ class SOLO2COCOConverter:
         # train, val and test split
         train_ratio = 0.8
         val_ratio = 0.05
-        test_ratio = 0.15
-
-        train_split = frames_list[: int(len(frames_list)*0.8)]
-        test_split = frames_list[int(len(frames_list)*0.8):]
 
         train_split = frames_list[: int(len(frames_list) * train_ratio)]
         val_split = frames_list[int(len(
             frames_list) * train_ratio): int(len(frames_list) * (train_ratio + val_ratio))]
         test_split = frames_list[int(
             len(frames_list) * (train_ratio + val_ratio)):]
-
-        for idx, frame in train_split:
-            result = self._process_instances(
-                frame, idx, output, self._solo.data_path, solo_kp_map)
-            self.callback(result)
-            # multi-processing commented out - to catch errors
-            # self._pool.apply_async(
-            # self._process_instances,
-            # args=(frame, idx, output, self._solo.data_path, solo_kp_map),
-            # callback=self.callback,
-            # )
-        # self._pool.close()
-        # self._pool.join()
-        self._write_out_annotations(output, type='train')
-
-        clear_anns()
-        for idx, frame in val_split:
-            result = self._process_instances(
-                frame, idx, output, self._solo.data_path, solo_kp_map)
-            self.callback(result)
-
-        self._write_out_annotations(output, type='test')
-
-        clear_anns()
-        for idx, frame in test_split:
-            result = self._process_instances(
-                frame, idx, output, self._solo.data_path, solo_kp_map)
-            self.callback(result)
-
-        self._write_out_annotations(output, type='test')
-
-        def clear_anns(self):
-            # clearing out previously written annotations
-            self._images = []
-            self._bbox_annotations = []
-            self._instance_annotations = []
-            self._semantic_annotations = []
-
+        
+        self._process_split(train_split, output, 'train')
+        self._process_split(val_split, output, 'val')
+        self._process_split(test_split, output, 'test')
 
 def save_masks_and_depth(image_id, filename, output, data_root, sequence_num):
     """Saves instance masks and depth maps from a sequence.
