@@ -378,7 +378,49 @@ class SOLO2COCOConverter:
         with open(output_file, "w") as out:
             json.dump(data, out, indent=3)
 
-    def _write_out_annotations(self, output_dir, type):
+    def _generate_hands_data(self, instances):
+        hands_data = {
+            "info": instances["info"],
+            "licences": instances["licences"],
+            "images": instances["images"],
+            "annotations": [],
+            "categories": []
+        }
+
+        ctr = 0
+        for annotation in instances["annotations"]:
+            if annotation["hand_side"] in [0, 1]:
+                record = {
+                    "id": ctr,
+                    "image_id": annotation["image_id"],
+                    "category_id": 0,
+                    "bbox": annotation["bbox"],
+                    "area": annotation["area"],
+                    "iscrowd": annotation["iscrowd"],
+                    "hand_side": annotation["hand_side"],
+                    "contact_state": annotation["contact_state"],
+                    "bbox_obj": [] if annotation["bbox_obj"] == [-1, -1, -1, -1] else annotation["bbox_obj"],
+                    "category_id_obj": annotation["id_obj"],
+                }
+                if annotation["contact_state"] == 1:
+                    bbox = annotation['bbox_obj']
+                    area = bbox[2] * bbox[3]
+                    record["area_obj"] = area
+
+                hands_data["annotations"].append(record)
+                ctr += 1
+
+        for category in instances["categories"]:
+            if category['name'] == 'hand':
+                hands_data["categories"].append({
+                    "id": 0,
+                    "name": category["name"],
+                    "supercategory": category["supercategory"]
+                })
+
+        return hands_data
+
+    def _write_out_annotations(self, output_dir, data_type):
         date_time = datetime.now()
         date_created = date_time.strftime("%A, %d %B, %Y")
         instances = {
@@ -405,94 +447,16 @@ class SOLO2COCOConverter:
             for idx, ann in enumerate(self._instance_annotations):
                 ann["id"] = idx
             instances["annotations"] = self._instance_annotations
-            if type == 'train':
-                self._create_ann_file(
-                    instances, output_dir, "train.json")
-            if type == 'test':
-                self._create_ann_file(
-                    instances, output_dir, "test.json")
-
-                # Adding fields for val_hands.json - contains data only specific to the hand and the contact obj
-                hands_data = {
-                    "info":instances["info"], "licences": instances["licences"], "images": instances["images"], "annotations": [], "categories": []}
-
-                ctr = 0
-                for annotation in instances["annotations"]:
-                    if annotation["hand_side"] in [0, 1]:
-
-                        record = {
-                            "id": ctr,
-                            "image_id": annotation["image_id"],
-                            "category_id": 0,
-                            "bbox": annotation["bbox"],
-                            "area": annotation["area"],
-                            "iscrowd": annotation["iscrowd"],
-                            "hand_side": annotation["hand_side"],
-                            "contact_state": annotation["contact_state"],
-                            "bbox_obj": [] if annotation["bbox_obj"] == [-1, -1, -1, -1] else annotation["bbox_obj"],
-                            "category_id_obj": annotation["id_obj"],
-                        }
-                        if annotation["contact_state"] == 1:
-                            bbox = annotation['bbox_obj']
-                            area = bbox[2] * bbox[3]
-                            record["area_obj"] = area
-
-                        hands_data["annotations"].append(record)
-                        ctr += 1
-
-                for category in instances["categories"]:
-                    if category['name'] == 'hand':
-                        hands_data["categories"].append({
-                            "id": 0,
-                            "name": category["name"],
-                            "supercategory": category["supercategory"]
-                        })
-
-                self._create_ann_file(
-                    hands_data, output_dir, "test_hands.json")
             
-            if type == 'val':
-                self._create_ann_file(
-                    instances, output_dir, "val.json")
+            filename = f"{data_type}.json"
 
-                # Adding fields for val_hands.json - contains data only specific to the hand and the contact obj
-                hands_data = {
-                    "images": instances["images"], "annotations": [], "categories": []}
+            self._create_ann_file(instances, output_dir, filename)
 
-                ctr = 0
-                for annotation in instances["annotations"]:
-                    if annotation["hand_side"] in [0, 1]:
+            if data_type in ['val', 'test']:
+                hands_data = self._generate_hands_data(instances)
+                hands_filename = f"{data_type}_hands.json"
+                self._create_ann_file(hands_data, output_dir, hands_filename)
 
-                        record = {
-                            "id": ctr,
-                            "image_id": annotation["image_id"],
-                            "category_id": 0,
-                            "bbox": annotation["bbox"],
-                            "area": annotation["area"],
-                            "iscrowd": annotation["iscrowd"],
-                            "hand_side": annotation["hand_side"],
-                            "contact_state": annotation["contact_state"],
-                            "bbox_obj": [] if annotation["bbox_obj"] == [-1, -1, -1, -1] else annotation["bbox_obj"],
-                            "category_id_obj": annotation["id_obj"],
-                        }
-                        if annotation["contact_state"] == 1:
-                            bbox = annotation['bbox_obj']
-                            area = bbox[2] * bbox[3]
-                            record["area_obj"] = area
-
-                        hands_data["annotations"].append(record)
-                        ctr += 1
-
-                for category in instances["categories"]:
-                    if category['name'] == 'hand':
-                        hands_data["categories"].append({
-                            "id": 0,
-                            "name": category["name"],
-                            "supercategory": category["supercategory"]
-                        })
-
-                self._create_ann_file(
-                    hands_data, output_dir, "val_hands.json")
         else:
             for idx, ann in enumerate(self._bbox_annotations):
                 ann["id"] = idx
@@ -564,7 +528,7 @@ class SOLO2COCOConverter:
             pool.close()
             pool.join()
 
-        self._write_out_annotations(output, type=split_type)
+        self._write_out_annotations(output, data_type=split_type)
         self._clear_annotations()
     
     def _clear_annotations(self):
